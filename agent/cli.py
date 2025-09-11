@@ -14,20 +14,17 @@ from agent.orchestrator import Orchestrator
 
 
 async def main():
-    # 加载配置
     cfg = AppConfig()
 
-    # --- LLM & Embeddings ---
+    # 初始化 LLM & Embeddings
     llm = LLM(cfg.llm)
-
-    # 关键：把 config 里的 api_key 也传给 Embeddings（否则只会读环境变量）
     emb_api_key = cfg.llm.api_key or os.getenv("OPENAI_API_KEY", "")
     emb = Embeddings(model="text-embedding-3-small", api_key=emb_api_key)
 
     retr = Retriever(cfg.rag, emb)
     mem = Memory()
 
-    # --- 可选：MCP 工具端 ---
+    # MCP（可选）
     mcp = None
     router = None
     if cfg.mcp.command:
@@ -42,14 +39,15 @@ async def main():
             mcp = None
             router = None
 
-    # --- Orchestrator ---
-    # 先用 rag_top_k=0 验证直连；稳定后改回 cfg.rag.top_k（例如 2 或 4）
-    rag_top_k = cfg.rag.top_k  # 如需临时关闭 RAG，可改成 0
-    orch = Orchestrator(llm, retr, mem, router, rag_top_k=rag_top_k)
+    # Orchestrator
+    orch = Orchestrator(llm, retr, mem, router, rag_top_k=cfg.rag.top_k)
 
-    print("🤖 Minimal Agent ready. 输入你的问题，/exit 退出。")
+    print("🤖 学习助教 Agent 已就绪！")
+    print("直接输入问题 → 知识问答")
+    print("/explain <主题> → 讲解模式")
+    print("/solve <题目> → 解题模式")
+    print("/exit → 退出")
 
-    # 交互循环
     while True:
         try:
             q = input("\nYou> ").strip()
@@ -60,15 +58,23 @@ async def main():
         if q in ("/exit", "exit", "quit"):
             break
 
+        # 解析模式
+        if q.startswith("/explain "):
+            mode = "explain"
+            q = q[len("/explain "):].strip()
+        elif q.startswith("/solve "):
+            mode = "solve"
+            q = q[len("/solve "):].strip()
+        else:
+            mode = "qa"
+
         try:
-            ans = await orch.step(q)
+            ans = await orch.step(q, mode=mode)
             print(f"\nAgent> {ans}")
         except Exception as e:
-            # 打印完整堆栈，便于快速定位
             print("Error:", repr(e))
             traceback.print_exc()
 
-    # 退出前清理 MCP
     if mcp:
         try:
             await mcp.stop()

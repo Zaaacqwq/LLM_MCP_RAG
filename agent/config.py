@@ -1,4 +1,6 @@
 import os
+import sys
+
 from dotenv import load_dotenv
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,4 +37,4 @@ class MCPConfig:
 class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
-    mcp: MCPConfig = field(default_factory=MCPConfig)
+    mcp: MCPConfig = MCPConfig(command=[sys.executable, "tools/math_server.py"])

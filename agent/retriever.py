@@ -1,79 +1,100 @@
-import json, re
+# agent/retriever.py
+import json
+import fitz
 from pathlib import Path
-from .embeddings import Embeddings, cosine_sim
-from .config import RAGConfig
+from agent.embeddings import Embeddings, cosine_sim
+from agent.config import RAGConfig
+
 
 def simple_split(text: str, size: int, overlap: int):
-    # 1) 参数合法化
+    # 参数合法化
     size = max(1, int(size))
     overlap = max(0, int(overlap))
     if overlap >= size:
-        overlap = size - 1  # 保证每次都有正向前进
+        overlap = size - 1
 
     chunks = []
     n = len(text)
     start = 0
-
-    # 2) 安全上限，防意外死循环
-    MAX_CHUNKS = 10000
+    MAX_CHUNKS = 10000  # 防止死循环
 
     while start < n and len(chunks) < MAX_CHUNKS:
         end = min(n, start + size)
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
-
-        # 关键修复：一旦到文本末尾，立即退出，避免重复尾块
         if end == n:
             break
-
-        # 正常前进：上一个起点 + size - overlap
         next_start = start + size - overlap
-
-        # 3) 再保险：若没有前进，则强制前进一步
         if next_start <= start:
             next_start = end
-
         start = next_start
 
     return chunks
+
 
 class Retriever:
     def __init__(self, cfg: RAGConfig, emb: Embeddings):
         self.cfg = cfg
         self.emb = emb
         self.index = {"embeddings": [], "metas": []}
-        if cfg.index_path.exists():
-            self.index = json.loads(cfg.index_path.read_text("utf-8"))
+
+        # 尝试加载已有索引
+        try:
+            if cfg.index_path.exists() and cfg.index_path.stat().st_size > 0:
+                self.index = json.loads(cfg.index_path.read_text("utf-8"))
+        except Exception as e:
+            print("⚠️ index.json 无效，将重建:", e)
+            self.index = {"embeddings": [], "metas": []}
 
     def build_index_from_docs(self):
-        docs = []
-        for p in self.cfg.docs_dir.rglob("*"):
-            if p.suffix.lower() in {".txt", ".md"}:
-                docs.append(p.read_text("utf-8", errors="ignore"))
         chunks = []
-        for d in docs:
-            chunks.extend(simple_split(d, self.cfg.chunk_size, self.cfg.chunk_overlap))
-        return chunks
+        metas = []
+        for p in self.cfg.docs_dir.rglob("*"):
+            suffix = p.suffix.lower()
+            if suffix in {".txt", ".md"}:
+                text = p.read_text("utf-8", errors="ignore")
+            elif suffix == ".pdf":
+                text = self._read_pdf(p)
+            else:
+                continue
 
-    # 替换 ensure_index 为分批实现
-    async def ensure_index(self, batch_size: int = 16):  # 小批量
+            parts = simple_split(text, self.cfg.chunk_size, self.cfg.chunk_overlap)
+            for i, part in enumerate(parts):
+                metas.append({
+                    "text": part,
+                    "source": str(p),
+                    "chunk_id": i
+                })
+                chunks.append(part)
+        return chunks, metas
+
+    def _read_pdf(self, path: Path) -> str:
+        """读取 PDF 并返回纯文本"""
+        text = []
+        with fitz.open(path) as doc:
+            for page in doc:
+                text.append(page.get_text())
+        return "\n".join(text)
+
+    async def ensure_index(self, batch_size: int = 16):
         if self.index["embeddings"]:
             return
-        chunks = self.build_index_from_docs()
+
+        chunks, metas = self.build_index_from_docs()
         if not chunks:
             self.index = {"embeddings": [], "metas": []}
             return
 
-        embeddings, metas = [], []
+        embeddings, metas_out = [], []
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i:i + batch_size]
             vecs = await self.emb.embed(batch)
             embeddings.extend(vecs)
-            metas.extend([{"text": c} for c in batch])
+            metas_out.extend(metas[i:i + batch_size])
 
-            # 原子落盘，避免半成品 index 导致下次 JSONDecodeError
-            self.index = {"embeddings": embeddings, "metas": metas}
+            # 分批落盘，防止中途崩溃
+            self.index = {"embeddings": embeddings, "metas": metas_out}
             self.cfg.index_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.cfg.index_path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(self.index, ensure_ascii=False), "utf-8")
@@ -83,9 +104,10 @@ class Retriever:
         await self.ensure_index()
         if not self.index["embeddings"]:
             return []
-        qv = (await self.emb.embed([query]))[0]
-        scored = [(cosine_sim(qv, vec), meta["text"])
-                  for vec, meta in zip(self.index["embeddings"], self.index["metas"])]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [t for _, t in scored[:k]]
 
+        qv = (await self.emb.embed([query]))[0]
+        scored = []
+        for vec, meta in zip(self.index["embeddings"], self.index["metas"]):
+            scored.append((cosine_sim(qv, vec), meta))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [meta for _, meta in scored[:k]]

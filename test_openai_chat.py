@@ -1,7 +1,7 @@
 # python -u test_openai_chat.py
 import os, httpx, json, asyncio
 
-API_KEY = "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"  # 仅临时测试，用完删
+API_KEY = ""  # 仅临时测试，用完删
 MODEL = "gpt-4o-mini"              # 建议先用这个小模型测试
 
 async def main():

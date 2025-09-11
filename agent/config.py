@@ -6,7 +6,7 @@ class LLMConfig:
     provider: str = "openai"
     model: str = "gpt-4.1"
     api_base: str = "https://api.openai.com/v1"
-    api_key: str = "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"
+    api_key: str = ""
 
 @dataclass
 class RAGConfig:

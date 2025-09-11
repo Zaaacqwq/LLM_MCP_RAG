@@ -1,12 +1,21 @@
+import os
+from dotenv import load_dotenv
 from dataclasses import dataclass, field
 from pathlib import Path
+
+load_dotenv()
+
+# 读取 OpenAI API Key
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY. Please set it in .env or environment variables.")
 
 @dataclass
 class LLMConfig:
     provider: str = "openai"
     model: str = "gpt-4.1"
     api_base: str = "https://api.openai.com/v1"
-    api_key: str = ""
+    api_key: str = OPENAI_API_KEY
 
 @dataclass
 class RAGConfig:

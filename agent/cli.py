@@ -1,6 +1,7 @@
 # agent/cli.py
 import os
 import asyncio
+import shlex
 import traceback
 
 from agent.config import AppConfig
@@ -29,16 +30,13 @@ async def main():
     router = None
 
     def _split_commands(cmd):
-        # 支持：字符串用 ; 分隔、多行；或传 list/list[list]
+        # 支持：字符串（可含引号/空格），用 ; 或换行分多条；也支持 list / list[list]
         if isinstance(cmd, str):
             parts = [p.strip() for p in cmd.replace("\n", ";").split(";") if p.strip()]
-            return [[*p.split(" ", 1)][0], *([p.split(" ", 1)[1]] if " " in p else [])] and [
-                p.split(" ") for p in parts
-            ]
+            return [shlex.split(p) for p in parts]
         if isinstance(cmd, (list, tuple)):
-            # 如果是 list[list] 就原样返回；如果是 list[str] 就包一层
             if cmd and isinstance(cmd[0], (list, tuple)):
-                return list(cmd)
+                return [list(x) for x in cmd]
             return [list(cmd)]
         return []
 
@@ -62,6 +60,7 @@ async def main():
                 last_err = None
                 for c in self.clients:
                     try:
+                        print(f"[MCP] call {name} args={arguments}")
                         return await c.tools_call(name, arguments)
                     except Exception as e:
                         msg = str(e).lower()
@@ -85,6 +84,9 @@ async def main():
             router = CombinedRouter(mcp_clients)
         else:
             router = None
+
+        retr.set_router(router)
+
     except Exception as e:
         print("⚠️ MCP 初始化失败，将不使用工具。原因：", repr(e))
         for c in mcp_clients:
@@ -115,6 +117,16 @@ async def main():
         if q in ("/exit", "exit", "quit"):
             break
 
+            # 新增 reindex 命令
+        if q == "/reindex":
+            try:
+                print("🔄 强制重建索引中...")
+                await retr.ensure_index(force=True)
+                print("✅ 索引已重建 (built_by:", retr.index.get("built_by"), ")")
+            except Exception as e:
+                print("❌ 重建失败:", e)
+            continue
+
         # 解析模式
         if q.startswith("/explain "):
             mode = "explain"
@@ -135,9 +147,9 @@ async def main():
             print("Error:", repr(e))
             traceback.print_exc()
 
-    if mcp:
+    for c in mcp_clients:
         try:
-            await mcp.stop()
+            await c.stop()
         except Exception:
             pass
 

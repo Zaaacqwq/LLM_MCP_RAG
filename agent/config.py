@@ -40,4 +40,5 @@ class AppConfig:
     mcp: MCPConfig = MCPConfig(command=[
         [sys.executable, "tools/math_server.py"],
         [sys.executable, "tools/code_server.py"],
+        [sys.executable, "tools/file_server.py"],
     ])

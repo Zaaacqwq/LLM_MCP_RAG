@@ -29,12 +29,15 @@ class RAGConfig:
 
 @dataclass
 class MCPConfig:
-    # 演示：通过子进程/stdio 连接 MCP server（你也可换成 TCP）
-    command: list[str] | None = None  # 例如 ["python", "tools/demo_server.py"]
+    # 既支持单个命令 list[str]，也支持多个命令 list[list[str]]
+    command: list | None = None
     request_timeout_s: float = 20.0
 
 @dataclass
 class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
-    mcp: MCPConfig = MCPConfig(command=[sys.executable, "tools/math_server.py"])
+    mcp: MCPConfig = MCPConfig(command=[
+        [sys.executable, "tools/math_server.py"],
+        [sys.executable, "tools/code_server.py"],
+    ])

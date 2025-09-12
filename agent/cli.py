@@ -97,14 +97,15 @@ async def main():
         mcp_clients = []
         router = None
 
-    # Orchestrator
+    # Orchestrator（这里面包含新的 /reindex 重建逻辑：MCP 读文件 + 本地 chunker 切割）
     orch = Orchestrator(llm, retr, mem, router, rag_top_k=cfg.rag.top_k)
 
     print("🤖 学习助教 Agent 已就绪！")
     print("直接输入问题 → 知识问答")
     print("/explain <主题> → 讲解模式")
     print("/solve <题目> → 解题模式")
-    print("/run <lang> <code or ```...```> [--timeout=秒] → 运行代码（python/c/cpp/java）")  # ← 新增
+    print("/run <lang> <code or ```...```> [--timeout=秒] → 运行代码（python/c/cpp/java）")
+    print("/reindex → 读取文档并用本地 chunker 重建索引")
     print("/exit → 退出")
 
     while True:
@@ -117,12 +118,12 @@ async def main():
         if q in ("/exit", "exit", "quit"):
             break
 
-            # 新增 reindex 命令
+        # 新的 reindex 命令：调用 orchestrator.reindex()（不再走 MCP 的 file.chunk）
         if q == "/reindex":
             try:
                 print("🔄 强制重建索引中...")
-                await retr.ensure_index(force=True)
-                print("✅ 索引已重建 (built_by:", retr.index.get("built_by"), ")")
+                res = await orch.reindex()
+                print(f"✅ 索引已重建  (chunks={res.get('chunks')}, built_by: {res.get('built_by')})")
             except Exception as e:
                 print("❌ 重建失败:", e)
             continue

@@ -36,10 +36,16 @@ def _read_docx(p: Path) -> str:
     return "\n".join([para.text for para in d.paragraphs])
 
 def _file_read_dir(args: dict) -> dict:
+    """
+    仅用于读取文件，返回每个文件的 meta + content。
+    不做切割；切割交给 agent.chunkers 中的 get_chunker。
+    """
     base = Path(args.get("dir", "."))
     patterns = args.get("patterns", ["*.txt", "*.md", "*.pdf"])
     recursive = bool(args.get("recursive", True))
     limit = args.get("limit")
+    normalize = bool(args.get("normalize", True))
+
     files = []
     for pat in patterns:
         glob_pat = f"**/{pat}" if recursive else pat
@@ -67,31 +73,23 @@ def _file_read_dir(args: dict) -> dict:
             else:
                 meta["error"] = "unsupported"
                 content = ""
+            if normalize and content:
+                # 简单的换行归一/去 BOM 等
+                content = content.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
         except Exception as e:
             meta["error"] = str(e)
             content = ""
         out["files"].append({"meta": meta, "content": content})
     return out
 
-def _simple_split(text: str, size: int, overlap: int, preserve_newlines: bool = True):
-    size = max(1, int(size)); overlap = max(0, int(overlap))
-    if overlap >= size: overlap = size - 1
-    chunks, n, start, MAX = [], len(text), 0, 10000
-    while start < n and len(chunks) < MAX:
-        end = min(n, start + size)
-        chunk = text[start:end]
-        if not preserve_newlines:
-            chunk = " ".join(chunk.splitlines())
-        chunk = chunk.strip()
-        if chunk: chunks.append(chunk)
-        if end == n: break
-        next_start = start + size - overlap
-        if next_start <= start: next_start = end
-        start = next_start
-    return chunks
+# ---- MCP handlers ----
 
-def _handle_initialize(params, id): _send({"server": "file-server", "version": "0.1"}, id)
-def _handle_tools_list(params, id): _send({"tools": ["file.read_dir", "file.chunk"]}, id)
+def _handle_initialize(params, id):
+    _send({"server": "file-server", "version": "0.2", "capability": "read-only"}, id)
+
+def _handle_tools_list(params, id):
+    # 只暴露读取工具；不再提供 file.chunk
+    _send({"tools": ["file.read_dir"]}, id)
 
 def _handle_tools_call(params, id):
     name = params.get("name", "")
@@ -99,13 +97,6 @@ def _handle_tools_call(params, id):
     try:
         if name == "file.read_dir":
             res = _file_read_dir(args)
-        elif name == "file.chunk":
-            res = {"chunks": _simple_split(
-                args.get("text", ""),
-                int(args.get("chunk_size", 1000)),
-                int(args.get("chunk_overlap", 100)),
-                bool(args.get("preserve_newlines", True)),
-            )}
         else:
             raise RuntimeError("unknown tool")
         _send(res, id)

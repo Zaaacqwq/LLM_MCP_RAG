@@ -8,31 +8,14 @@ from typing import List, Dict, Any, Optional, Tuple
 import fitz  # PyMuPDF
 
 from agent.embeddings import Embeddings, cosine_sim
-from agent.config import RAGConfig
-
-
-def simple_split(text: str, size: int, overlap: int):
-    size = max(1, int(size))
-    overlap = max(0, int(overlap))
-    if overlap >= size:
-        overlap = size - 1
-    chunks, n, start, MAX = [], len(text), 0, 10000
-    while start < n and len(chunks) < MAX:
-        end = min(n, start + size)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end == n:
-            break
-        next_start = start + size - overlap
-        if next_start <= start:
-            next_start = end
-        start = next_start
-    return chunks
+from agent.config import RAGConfig, CHUNK, LLMConfig
+from agent.chunkers import get_chunker
+from agent.llm import LLM
 
 
 def _hash_list(items: List[Tuple[str, int, int]]) -> str:
     """对 (key, mtime, size) 列表做稳定哈希，作为 docs 签名。"""
+    import hashlib
     h = hashlib.sha256()
     for k, m, s in sorted(items, key=lambda x: x[0]):
         h.update(str(k).encode("utf-8")); h.update(b"|")
@@ -43,14 +26,12 @@ def _hash_list(items: List[Tuple[str, int, int]]) -> str:
 
 class Retriever:
     """
-    读取 → 分块 → 向量化 → 索引落盘（data/index.json）
-    - 若注入了 self.router（JSON-RPC MCP 路由）：优先用 file_server 工具
-    - 否则回退到本地实现（txt/md 直接读，pdf 用 fitz）
-    额外能力：
-      - built_by: "mcp" / "local"
+    读取 → 分块(本地 chunker/可选 LLM 大纲) → 向量化 → 索引落盘（data/index.json）
+    - 若注入了 self.router（JSON-RPC MCP 路由）：仅用于 file.read_dir 读取原文
+    - 切割统一走本地 chunker（不再调用 MCP 的 file.chunk）
+    元数据：
+      - built_by: "mcp"（表示读取来源于 MCP）或 "local"（本地读取）；与切割方式无关
       - docs_sig: 基于 (path/mtime/size) 的文档签名
-      - force: 强制重建
-      - 自动发现文档变化并重建
     """
     def __init__(self, cfg: RAGConfig, emb: Embeddings):
         self.cfg = cfg
@@ -66,6 +47,18 @@ class Retriever:
             print("⚠️ index.json 无效，将重建:", e)
             self.index = {"embeddings": [], "metas": []}
 
+        # 预创建一个 chunker（llm_outline 需要 LLM）
+        self._llm = LLM(LLMConfig())
+        self._chunker = get_chunker(
+            name=CHUNK.name,
+            chunk_size=CHUNK.chunk_size,
+            chunk_overlap=CHUNK.chunk_overlap,
+            semantic_model=CHUNK.semantic_model,
+            sim_threshold=CHUNK.semantic_sim_threshold,
+            llm=self._llm,
+            max_chars_per_call=CHUNK.max_chars_per_call,
+        )
+
     def set_router(self, router):
         """CLI 初始化 MCP 后调用：retr.set_router(router)"""
         self.router = router
@@ -78,12 +71,23 @@ class Retriever:
                 text.append(page.get_text())
         return "\n".join(text)
 
+    def _read_docx(self, path: Path) -> str:
+        try:
+            import docx
+        except Exception:
+            return ""
+        try:
+            d = docx.Document(str(path))
+            return "\n".join(p.text for p in d.paragraphs)
+        except Exception:
+            return ""
+
     def _scan_local_sig(self) -> Tuple[List[Tuple[str, int, int]], List[Path]]:
         files: List[Path] = []
         sig_items: List[Tuple[str, int, int]] = []
         for p in self.cfg.docs_dir.rglob("*"):
             suf = p.suffix.lower()
-            if suf not in {".txt", ".md", ".pdf"}:
+            if suf not in {".txt", ".md", ".pdf", ".docx"}:
                 continue
             try:
                 st = p.stat()
@@ -93,7 +97,7 @@ class Retriever:
             sig_items.append((str(p), int(st.st_mtime), int(st.st_size)))
         return sig_items, files
 
-    # ---------- MCP 路径 ----------
+    # ---------- MCP 读取路径（仅 read_dir；切割走本地 chunker） ----------
     async def build_index_from_docs_via_mcp(self) -> tuple[
         Optional[List[str]], Optional[List[Dict[str, Any]]], Optional[str]
     ]:
@@ -125,20 +129,16 @@ class Retriever:
             if not content.strip():
                 continue
 
-            ck = await self.router.call("file.chunk", {
-                "text": content,
-                "chunk_size": self.cfg.chunk_size,
-                "chunk_overlap": self.cfg.chunk_overlap,
-                "preserve_newlines": True
-            })
-            for i, ch in enumerate(ck.get("chunks", [])):
+            # —— 使用本地 chunker 切割（替代 MCP file.chunk）——
+            parts = self._chunker.split(content)
+            for i, ch in enumerate(parts):
                 metas.append({"text": ch, "source": source, "chunk_id": i})
                 chunks.append(ch)
 
         docs_sig = _hash_list(sig_items)
         return chunks, metas, docs_sig
 
-    # ---------- 本地路径 ----------
+    # ---------- 本地读取路径（读本地文件 + 本地 chunker） ----------
     def build_index_from_docs_local(self) -> tuple[List[str], List[Dict[str, Any]], str]:
         chunks: List[str] = []
         metas: List[Dict[str, Any]] = []
@@ -150,25 +150,64 @@ class Retriever:
                     text = p.read_text("utf-8", errors="ignore")
                 elif suf == ".pdf":
                     text = self._read_pdf(p)
+                elif suf == ".docx":
+                    text = self._read_docx(p)
                 else:
                     continue
             except Exception:
                 continue
-            parts = simple_split(text, self.cfg.chunk_size, self.cfg.chunk_overlap)
+            parts = self._chunker.split(text)
             for i, part in enumerate(parts):
                 metas.append({"text": part, "source": str(p), "chunk_id": i})
                 chunks.append(part)
         docs_sig = _hash_list(sig_items)
         return chunks, metas, docs_sig
 
-    # ---------- 索引确保 ----------
+    # ---------- 直接重建索引（供 orchestrator 调用） ----------
+    async def rebuild_from_texts(
+            self,
+            texts: List[str],
+            metadatas: List[Dict[str, Any]],
+            batch_size: int = 16,
+            built_by: str = "local",
+            docs_sig: str = ""
+    ):
+        """用外部提供的切块重建索引（不走 MCP）。支持传入 built_by 与 docs_sig。"""
+        if not texts:
+            self.index = {
+                "embeddings": [],
+                "metas": [],
+                "built_by": built_by,
+                "docs_sig": docs_sig
+            }
+        else:
+            embeddings: List[List[float]] = []
+            metas_out: List[Dict[str, Any]] = []
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                vecs = await self.emb.embed(batch)
+                embeddings.extend(vecs)
+                metas_out.extend(metadatas[i:i + batch_size])
+            self.index = {
+                "embeddings": embeddings,
+                "metas": metas_out,
+                "built_by": built_by,
+                "docs_sig": docs_sig or self.index.get("docs_sig", "")
+            }
+
+        self.cfg.index_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.cfg.index_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.index, ensure_ascii=False), "utf-8")
+        tmp.replace(self.cfg.index_path)
+
+    # ---------- 索引确保（保持与原语义一致，但切割全走本地） ----------
     async def ensure_index(self, batch_size: int = 16, force: bool = False):
         """
         触发重建条件：
           - force=True
           - 未构建
           - 文档签名变化
-          - 现在有 MCP，但旧索引 built_by 为 local
+          - 现在有 MCP，但旧索引 built_by 为 local（优先用 MCP 读取）
         """
         built = bool(self.index.get("embeddings"))
         built_by_old = self.index.get("built_by")
@@ -191,18 +230,18 @@ class Retriever:
             if not need_rebuild:
                 return  # 无需重建
 
-        # ① 尝试 MCP
+        # ① 优先用 MCP 读取（切割仍是本地）
         chunks = metas = docs_sig = None
         built_by_now = "local"
         if prefer_mcp:
             try:
                 chunks, metas, docs_sig = await self.build_index_from_docs_via_mcp()
-                if chunks:
-                    built_by_now = "mcp"
+                if chunks is not None:
+                    built_by_now = "mcp"  # 表示“读取来自 MCP”
             except Exception as e:
                 print("⚠️ MCP 构建索引失败，自动回退本地读取：", e)
 
-        # ② 回退本地
+        # ② 回退本地读取
         if not chunks:
             chunks, metas, docs_sig = self.build_index_from_docs_local()
             built_by_now = "local"

@@ -23,3 +23,22 @@ class LLM:
                                   headers=headers, data=json.dumps(payload))
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"]
+
+    def complete_sync(self, messages: list[dict], temperature: float = 0.2) -> str:
+        """阻塞式调用，用于在非 async 环境（如 chunkers）里安全调用 LLM。"""
+        if self.cfg.provider != "openai":
+            raise NotImplementedError("Only OpenAI demo here.")
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.cfg.model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        with httpx.Client(timeout=60) as client:
+            r = client.post(f"{self.cfg.api_base}/chat/completions",
+                            headers=headers, json=payload)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]

@@ -1,11 +1,15 @@
 # agent/orchestrator.py
+import asyncio
 import re
 import json
 import ast
+from typing import List, Dict, Any
 
 from agent.memory import Memory
 from agent.retriever import Retriever
 from agent.llm import LLM
+from agent.config import APP, CHUNK, LLMConfig  # 读取 chunker 配置
+from agent.chunkers import get_chunker  # 本地切割工厂
 
 QA_PROMPT = """你是学习助教，用中文回答问题。
 - 只基于提供的[RAG]片段。
@@ -198,6 +202,7 @@ async def _run_mode_dispatch(router, payload: str):
             err = (run.get("stderr") or "").strip()
             return f"运行失败 (exit={rc}): {err.splitlines()[0] if err else 'unknown error'}"
 
+
 class Orchestrator:
     def __init__(self, llm: LLM, retriever: Retriever, memory: Memory, router, rag_top_k=4):
         self.llm = llm
@@ -205,6 +210,129 @@ class Orchestrator:
         self.memory = memory
         self.router = router
         self.rag_top_k = rag_top_k
+
+        # 预先构造 chunker（仅 llm_outline 需要 llm）
+        self._chunker = get_chunker(
+            name=CHUNK.name,
+            chunk_size=CHUNK.chunk_size,
+            chunk_overlap=CHUNK.chunk_overlap,
+            semantic_model=CHUNK.semantic_model,
+            sim_threshold=CHUNK.semantic_sim_threshold,
+            llm=self.llm,
+            max_chars_per_call=CHUNK.max_chars_per_call,
+        )
+
+    async def _mcp_read_dir(self, docs_dir: str) -> List[Dict[str, Any]]:
+        """只通过 MCP 读取文件（file.read_dir）。"""
+        if not self.router:
+            return []
+        args = {
+            "dir": docs_dir,
+            "patterns": ["*.pdf", "*.txt", "*.md", "*.docx"],
+            "recursive": True,
+            "limit": None,
+            "normalize": True,
+        }
+        try:
+            res = await _tools_call(self.router, "file.read_dir", args)
+            return res.get("files", []) if isinstance(res, dict) else []
+        except Exception:
+            # MCP 不可用或失败就返回空，外面会做本地兜底
+            return []
+
+    async def reindex(self) -> dict:
+        """
+        重新构建索引：
+          1) 用 MCP 读取原始文件内容（仅 read_dir）
+          2) 用本地 chunker 切割（可走 LLM 大纲）
+          3) 写入 retriever（带 built_by 和 docs_sig）
+        """
+        print("强制重建索引中...")
+
+        # 1) 读取文件（优先 MCP）
+        files = await self._mcp_read_dir(str(APP.rag.docs_dir))
+        used_mcp = bool(files)
+
+        # 2) 本地兜底读取（若 MCP 不可用）
+        if not files:
+            from pathlib import Path
+            print("➡️ 使用本地文件读取 fallback")
+            base = Path(APP.rag.docs_dir)
+            for p in base.rglob("*"):
+                if p.is_file() and p.suffix.lower() in (".pdf", ".txt", ".md", ".docx"):
+                    try:
+                        content = p.read_text("utf-8", errors="ignore")
+                    except Exception:
+                        content = ""
+                    try:
+                        st = p.stat()
+                        mtime = int(st.st_mtime)
+                        size = int(st.st_size)
+                    except Exception:
+                        mtime = 0
+                        size = len(content)
+                    files.append({
+                        "meta": {"source": str(p), "mtime": mtime, "size": size},
+                        "content": content
+                    })
+
+        # 2.5) 计算 docs 签名（统一：按 source/mtime/size）
+        import hashlib
+        sig_items = []
+        for f in files:
+            meta = f.get("meta") or {}
+            src = str(meta.get("source") or meta.get("path") or "unknown")
+            mtime = int(meta.get("mtime", 0)) if isinstance(meta.get("mtime", 0), (int, float)) else 0
+            size_meta = int(meta.get("size", 0)) if isinstance(meta.get("size", 0), (int, float)) else 0
+            content = f.get("content") or ""
+            size_for_sig = size_meta if size_meta > 0 else len(content)
+            sig_items.append((src, mtime, int(size_for_sig)))
+        h = hashlib.sha256()
+        for k, m, s in sorted(sig_items, key=lambda x: x[0]):
+            h.update(str(k).encode());
+            h.update(b"|")
+            h.update(str(int(m)).encode());
+            h.update(b"|")
+            h.update(str(int(s)).encode());
+            h.update(b"\n")
+        docs_sig = h.hexdigest()
+
+        # 3) 本地切割（替代 MCP file.chunk），chunker 名称来自 config
+        texts, metadatas = [], []
+        total_chunks = 0
+        for f in files:
+            text = (f.get("content") or "").strip()
+            if not text:
+                continue
+            meta = f.get("meta") or {}
+            chunks = self._chunker.split(text)
+            total_chunks += len(chunks)
+            texts.extend(chunks)
+            metadatas.extend([meta | {"chunk_id": i} for i in range(len(chunks))])
+
+        # 4) 写入索引（尽量适配不同 Retriever 实现）
+        async def maybe_await(x):
+            return await x if asyncio.iscoroutine(x) else x
+
+        try:
+            built_by = f"reader:{'mcp' if used_mcp else 'local'}; chunker:{CHUNK.name}"
+            if hasattr(self.retriever, "rebuild_from_texts"):
+                await maybe_await(self.retriever.rebuild_from_texts(
+                    texts, metadatas, built_by=built_by, docs_sig=docs_sig
+                ))
+            elif hasattr(self.retriever, "rebuild"):
+                # 旧接口：无法传 built_by/docs_sig，只能维持旧行为
+                await maybe_await(self.retriever.rebuild(texts=texts, metadatas=metadatas))
+            elif hasattr(self.retriever, "upsert_many"):
+                await maybe_await(self.retriever.upsert_many(texts, metadatas, rebuild=True))
+            elif hasattr(self.retriever, "add_texts"):
+                await maybe_await(self.retriever.add_texts(texts, metadatas))
+            else:
+                return {"chunks": total_chunks, "built_by": built_by + "; no-op"}
+        except Exception as e:
+            return {"chunks": total_chunks, "built_by": f"error:{e}"}
+
+        return {"chunks": total_chunks, "built_by": built_by}
 
     async def step(self, user_text: str, mode="qa"):
         self.memory.add_user(user_text)
@@ -242,7 +370,7 @@ class Orchestrator:
                     tool_obs = f"[math.plot] {json.dumps(res, ensure_ascii=False)}"
                     self.memory.add_assistant(f"✅ 已生成图像：{path}")
 
-                # ---------- 矩阵乘法：矩阵乘法/计算 <A> [*|×|x] <B> ----------
+                # ---------- 矩阵乘法 ----------
                 if tool_obs is None:
                     m2 = re.match(r"^(?:矩阵乘法|计算)\s+(\[.*\])\s*(?:\*|×|x)\s*(\[.*\])\s*$",
                                   txt.replace(" ", ""))
@@ -257,7 +385,7 @@ class Orchestrator:
                         shape = res.get("shape")
                         self.memory.add_assistant(f"✅ 矩阵乘法结果（shape={shape}）：\n{mat}")
 
-                # ---------- 求导：对 <expr> 求导 ----------
+                # ---------- 求导 ----------
                 if tool_obs is None:
                     m3 = re.match(r"^对\s+(.+?)\s+求导\s*$", txt)
                     if m3:
@@ -266,7 +394,7 @@ class Orchestrator:
                         tool_obs = f"[math.diff] {json.dumps(res, ensure_ascii=False)}"
                         self.memory.add_assistant(f"∂/∂x {expr} = {res.get('derivative')}")
 
-                # ---------- 积分：对 <expr> 积分 ----------
+                # ---------- 积分 ----------
                 if tool_obs is None:
                     m4 = re.match(r"^对\s+(.+?)\s+积分\s*$", txt)
                     if m4:

@@ -1,21 +1,91 @@
-# Python
+# -----------------------------
+# Python basics
+# -----------------------------
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.db
+*.py[cod]
+*$py.class
 
-# Virtual environment
-venv/
-.env/
+# Virtual environments
 .venv/
+venv/
 env/
 ENV/
+.conda/
+conda-env/
+pip-wheel-metadata/
 
-# Secrets
-.env
-*.env
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
 
-# IDE settings
-.idea/
+# Tests & tooling caches
+.pytest_cache/
+.tox/
+.nox/
+.mypy_cache/
+.pytype/
+.ruff_cache/
+.pyre/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+logs/
+*.log
+
+# Editors / IDEs
 .vscode/
+.idea/
+*.code-workspace
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets / local config
+.env
+.env.*
+*.env
+*.secret
+secrets/*.json
+
+# -----------------------------
+# Project-specific (RAG index)
+# -----------------------------
+# ANN/Flat 索引与元数据（运行时生成）
+data/index*.bin
+data/index*.npz
+data/index.json
+# 若索引前缀不同，也排除所有 data 下的二进制索引文件
+data/*.bin
+data/*.npz
+
+# 缓存（按需）
+data/cache/
+.cache/
+.checkpoints/
+
+# （可选）如果不想把本地文档纳入版本控制，取消下一行注释
+# data/docs/**
+# 并保留一个占位文件
+# !data/docs/.keep
+
+# -----------------------------
+# Native / compiled artifacts (for /run 执行的临时代码)
+# -----------------------------
+*.o
+*.obj
+*.dll
+*.so
+*.dylib
+*.exe
+*.out

@@ -1,0 +1,13 @@
+# agent/indexes/vector_index.py
+from __future__ import annotations
+from typing import Protocol, Tuple
+from pathlib import Path
+import numpy as np
+
+class VectorIndex(Protocol):
+    """最小化向量索引接口，便于替换后端。"""
+    kind: str  # 'hnsw' | 'flat'
+    def add_batch(self, X: np.ndarray, ids: np.ndarray) -> None: ...
+    def search(self, Q: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]: ...
+    def save(self, path_prefix: Path) -> None: ...
+    def load(self, path_prefix: Path) -> None: ...

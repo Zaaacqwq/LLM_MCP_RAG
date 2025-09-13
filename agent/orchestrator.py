@@ -307,8 +307,9 @@ class Orchestrator:
             meta = f.get("meta") or {}
             chunks = self._chunker.split(text)
             total_chunks += len(chunks)
-            texts.extend(chunks)
-            metadatas.extend([meta | {"chunk_id": i} for i in range(len(chunks))])
+            for i, ch in enumerate(chunks):
+                texts.append(ch)
+                metadatas.append(meta | {"chunk_id": i, "text": ch})
 
         # 4) 写入索引（尽量适配不同 Retriever 实现）
         async def maybe_await(x):

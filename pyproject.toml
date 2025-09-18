@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-mcp-rag"
+version = "0.1.0"
+description = "Stable tool-first agent scaffold with MCP and local fallbacks"
+requires-python = ">=3.10"
+dependencies = [
+  "pydantic>=2.6",
+  "sympy>=1.12",
+  "rich>=13.7",
+  "click>=8.1",
+  "python-dotenv>=1.0",
+  "structlog>=24.1",
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "hnswlib>=0.8.0",
+  "numpy>=1.26",
+  "openai>=1.45.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "httpx", "anyio"]
+
+[tool.setuptools.packages.find]
+where = [""]
+include = ["agent*", "tools*", "retriever*", "server*", "config*"]

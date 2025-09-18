@@ -1,91 +1,50 @@
-# -----------------------------
-# Python basics
-# -----------------------------
+# ---- Python 常规 ----
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
+*.pyd
+*.so
+*.dll
 
-# Virtual environments
+# 虚拟环境
 .venv/
 venv/
 env/
-ENV/
-.conda/
-conda-env/
-pip-wheel-metadata/
 
-# Build / packaging
+# 构建产物
 build/
 dist/
 *.egg-info/
 .eggs/
 
-# Tests & tooling caches
+# 测试/覆盖率
 .pytest_cache/
-.tox/
-.nox/
-.mypy_cache/
-.pytype/
-.ruff_cache/
-.pyre/
-
-# Coverage
-.coverage
-.coverage.*
+.coverage*
 htmlcov/
+.tox/
+.mypy_cache/
+.cache/
 
-# Jupyter
-.ipynb_checkpoints/
-
-# Logs
-logs/
+# 日志/临时
 *.log
+*.tmp
+*.swp
+*.swo
 
-# Editors / IDEs
-.vscode/
-.idea/
-*.code-workspace
+# 本项目运行数据（索引、缓存等）
+.data/
+!.data/.gitkeep
 
-# OS junk
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Secrets / local config
+# 环境变量文件（保留示例）
 .env
 .env.*
-*.env
-*.secret
-secrets/*.json
+!.env.example
 
-# -----------------------------
-# Project-specific (RAG index)
-# -----------------------------
-# ANN/Flat 索引与元数据（运行时生成）
-data/index*.bin
-data/index*.npz
-data/index.json
-# 若索引前缀不同，也排除所有 data 下的二进制索引文件
-data/*.bin
-data/*.npz
+# IDE / 编辑器
+.idea/
+.vscode/
+*.iml
 
-# 缓存（按需）
-data/cache/
-.cache/
-.checkpoints/
-
-# （可选）如果不想把本地文档纳入版本控制，取消下一行注释
-# data/docs/**
-# 并保留一个占位文件
-# !data/docs/.keep
-
-# -----------------------------
-# Native / compiled artifacts (for /run 执行的临时代码)
-# -----------------------------
-*.o
-*.obj
-*.dll
-*.so
-*.dylib
-*.exe
-*.out
+# OS 杂项
+.DS_Store
+Thumbs.db

@@ -1,422 +1,304 @@
-# agent/orchestrator.py
-import asyncio
-import re
-import json
-import ast
-from typing import List, Dict, Any
-
-from agent.memory import Memory
-from agent.retriever import Retriever
+from typing import List
+import json, re  # 新增：用于 /matmul 与 /plot 参数解析
+from .schema import OrchestratorResult, Message, RetrieveHit, ToolCall
+from retriever.pipeline import query as retrieve_query
+from tools.tool_router import call as tool_call
+from config.settings import settings
 from agent.llm import LLM
-from agent.config import APP, CHUNK, LLMConfig  # 读取 chunker 配置
-from agent.chunkers import get_chunker  # 本地切割工厂
 
-QA_PROMPT = """你是学习助教，用中文回答问题。
-- 只基于提供的[RAG]片段。
-- 若片段不足，请明确说“不足”。"""
-
-EXPLAIN_PROMPT = """你是学习助教，用中文讲解知识点。
-- 基于[RAG]片段。
-- 给出：直白解释、关键公式/定义、类比举例、常见误区。"""
-
-SOLVE_PROMPT = """你是学习助教，用中文解答习题。
-- 先写思路，再分步骤推导，最后给出答案。
-- 若[RAG]片段不足，可用常识或数学知识补充，但要标明。"""
-
-
-def build_messages(mem: Memory, rag_ctx: list[dict] | None, tool_obs: str | None, mode: str):
-    if mode == "qa":
-        sys_prompt = QA_PROMPT
-    elif mode == "explain":
-        sys_prompt = EXPLAIN_PROMPT
-    elif mode == "solve":
-        sys_prompt = SOLVE_PROMPT
-    else:
-        sys_prompt = QA_PROMPT
-
-    msgs = [{"role": "system", "content": sys_prompt}]
-
-    if rag_ctx:
-        ctx = "\n".join(
-            [
-                f"({i+1}) 来自: {meta.get('source')}#{meta.get('chunk_id')}\n{meta['text']}"
-                for i, meta in enumerate(rag_ctx)
-            ]
-        )
-        msgs.append({"role": "system", "content": "[RAG]\n" + ctx})
-
-    if tool_obs:
-        msgs.append({"role": "system", "content": f"[Tool Result]\n{tool_obs}"})
-
-    msgs.extend(mem.context())
-    return msgs
-
-
-async def _tools_call(router, name: str, args: dict):
-    if router is None:
-        raise RuntimeError("工具不可用：未连接 MCP。")
-    if hasattr(router, "call"):
-        return await router.call(name, args)
-    if hasattr(router, "invoke"):
-        return await router.invoke(name, args)
-    if getattr(router, "mcp", None) and hasattr(router.mcp, "tools_call"):
-        return await router.mcp.tools_call(name, args)
-    raise RuntimeError("无法调用工具：未发现可用的调用方法。")
-
-
-def _parse_matrix_side(text: str):
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        return ast.literal_eval(text)
-
-
-def _strip_code_block(code: str) -> str:
-    code = code.strip()
-    if code.startswith("```") and code.endswith("```") and len(code) >= 6:
-        return code[3:-3]
+# ====== helpers ======
+def _unescape_one_line(code: str) -> str:
+    """
+    仅把未转义的 \\n / \\t 展开成真正换行/制表，
+    保留字符串中的 \\n（双反斜杠）不动。
+    例：'line1\\nline2' -> 'line1\nline2'
+        'printf(\"Hello C!\\\\n\");' 保持不变
+    """
+    code = re.sub(r'(?<!\\)\\n', '\n', code)
+    code = re.sub(r'(?<!\\)\\t', '\t', code)
     return code
 
+def _strip_cmd(text: str, cmd: str) -> str:
+    return text.replace(cmd, "", 1).strip()
 
-async def _run_mode_dispatch(router, payload: str):
+def _parse_matmul_args(s: str):
     """
-    解析并执行 run 模式：
-      语法：<lang> <code or ```...```> [--timeout=秒] [--verbose]
-      语言：python/py, c, cpp/c++/cc, java
-    默认输出尽量精简；加 --verbose 输出完整细节。
+    支持：
+      1) /matmul [[1,2],[3,4]] * [[5,6],[7,8]]
+      2) /matmul A=[[1,2,3],[4,5,6]] B=[[7,8],[9,10],[11,12]]
     """
-    import re
+    s = s.strip()
+    # 形式1：矩阵 * 矩阵（或 x、×）
+    m = re.match(r'^\s*(\[[\s\S]+\])\s*([*x×])\s*(\[[\s\S]+\])\s*$', s, flags=re.I)
+    if m:
+        A = json.loads(m.group(1))
+        B = json.loads(m.group(3))
+        return A, B
+    # 形式2：A=..., B=...
+    mA = re.search(r'A\s*=\s*(\[[\s\S]+\])', s)
+    mB = re.search(r'B\s*=\s*(\[[\s\S]+\])', s)
+    if mA and mB:
+        A = json.loads(mA.group(1))
+        B = json.loads(mB.group(1))
+        return A, B
+    raise ValueError("矩阵输入格式不正确。示例：/matmul [[1,2],[3,4]] * [[5,6],[7,8]]")
 
-    # 提取可选 verbose / timeout
-    verbose = False
-    if "--verbose" in payload or "-v" in payload.split():
-        verbose = True
-        payload = payload.replace("--verbose", "").replace("-v", "")
-
-    timeout = None
-    m_to = re.search(r"--timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)", payload)
-    if m_to:
-        try:
-            timeout = float(m_to.group(1))
-        except Exception:
-            pass
-        payload = payload[:m_to.start()] + payload[m_to.end():]
-
-    payload = payload.strip()
-    if not payload:
-        return "用法：/run <python|c|cpp|java> <code or ```...```> [--timeout=秒] [--verbose]"
-
-    parts = payload.split(None, 1)
-    lang = parts[0].lower()
-    code = parts[1].strip() if len(parts) > 1 else ""
-
-    if lang in ("python", "py"):
-        tool = "python.run_code"
-    elif lang == "c":
-        tool = "c.run_code"
-    elif lang in ("cpp", "c++", "cc"):
-        tool = "cpp.run_code"
-    elif lang == "java":
-        tool = "java.run_code"
-    else:
-        return "不支持的语言，请使用：python/py、c、cpp、java。"
-
-    if not code:
-        return "请在同一行提供代码，或在同一条输入中用三引号包裹：```...```"
-
-    # 去除同一条输入内闭合的三引号
-    def _strip_code_block(s: str) -> str:
-        s = s.strip()
-        if s.startswith("```") and s.endswith("```") and len(s) >= 6:
-            return s[3:-3]
-        return s
-
-    code = _strip_code_block(code)
-    code = code.replace("\\n", "\n").replace("\\t", "\t")
-
-    args = {"code": code}
-    if timeout is not None:
-        args["timeout"] = timeout
-
-    res = await _tools_call(router, tool, args)
-
-    # ---------- 精简/详细 两种格式 ----------
-    def _indent(text: str, pad: str = "    ") -> str:
-        if text is None:
-            text = ""
-        if not text.endswith("\n"):
-            text += "\n"
-        return "".join(pad + ln for ln in text.splitlines(True))
-
-    def fmt_section(title, obj):
-        if not obj:
-            return ""
-        return (
-            f"{title}:\n"
-            f"  exit_code: {obj.get('exit_code')}\n"
-            f"  time_ms:   {obj.get('time_ms')}\n"
-            f"  stdout:\n{_indent(obj.get('stdout',''))}\n"
-            f"  stderr:\n{_indent(obj.get('stderr',''))}\n"
-        )
-
-    if verbose:
-        # 详细模式：保留完整结构信息
-        if tool == "python.run_code":
-            out = [
-                f"🟩 {tool}",
-                f"workdir: {res.get('workdir','')}",
-                f"files:   {', '.join(res.get('files', []))}",
-                fmt_section("run", res),
-            ]
-        else:
-            out = [
-                f"🟩 {tool}",
-                f"workdir: {res.get('workdir','')}",
-                f"files:   {', '.join(res.get('files', []))}",
-                fmt_section("compile", res.get("compile")),
-            ]
-            if res.get("compile", {}).get("exit_code") == 0:
-                out.append(fmt_section("run", res.get("run")))
-        return "\n".join(s for s in out if s)
-
-    # 精简模式：只给最关心的结果
-    if tool == "python.run_code":
-        rc = res.get("exit_code", 0)
-        if rc == 0:
-            return res.get("stdout", "").rstrip("\n") or "(无输出)"
-        else:
-            # 失败：给最关键的错误（stderr 的第一段）
-            err = (res.get("stderr") or "").strip()
-            return f"运行失败 (exit={rc}): {err.splitlines()[0] if err else 'unknown error'}"
-    else:
-        comp = res.get("compile", {}) or {}
-        if comp.get("exit_code", 0) != 0:
-            err = (comp.get("stderr") or "").strip()
-            return f"编译失败 (exit={comp.get('exit_code')}): {err.splitlines()[0] if err else 'unknown error'}"
-        run = res.get("run", {}) or {}
-        rc = run.get("exit_code", 0)
-        if rc == 0:
-            return run.get("stdout", "").rstrip("\n") or "(无输出)"
-        else:
-            err = (run.get("stderr") or "").strip()
-            return f"运行失败 (exit={rc}): {err.splitlines()[0] if err else 'unknown error'}"
+def _parse_plot_args(s: str):
+    """
+    支持：
+      /plot sin(x)/x
+      /plot sin(x)/x [-5, 5]
+      /plot sin(x)/x -5 5
+    """
+    s = s.strip()
+    # [a,b]
+    m = re.match(r'^(.*)\[\s*([+-]?\d+\.?\d*)\s*,\s*([+-]?\d+\.?\d*)\s*\]\s*$', s)
+    if m:
+        return m.group(1).strip(), float(m.group(2)), float(m.group(3))
+    # 尾部两个数字
+    m = re.match(r'^(.*)\s([+-]?\d+\.?\d*)\s([+-]?\d+\.?\d*)\s*$', s)
+    if m:
+        return m.group(1).strip(), float(m.group(2)), float(m.group(3))
+    # 只给表达式：默认区间
+    return s, -10.0, 10.0
 
 
 class Orchestrator:
-    def __init__(self, llm: LLM, retriever: Retriever, memory: Memory, router, rag_top_k=4):
-        self.llm = llm
-        self.retriever = retriever
+    def __init__(self, memory):
         self.memory = memory
-        self.router = router
-        self.rag_top_k = rag_top_k
+        self._llm = None
 
-        # 预先构造 chunker（仅 llm_outline 需要 llm）
-        self._chunker = get_chunker(
-            name=CHUNK.name,
-            chunk_size=CHUNK.chunk_size,
-            chunk_overlap=CHUNK.chunk_overlap,
-            semantic_model=CHUNK.semantic_model,
-            sim_threshold=CHUNK.semantic_sim_threshold,
-            llm=self.llm,
-            max_chars_per_call=CHUNK.max_chars_per_call,
-        )
-
-    async def _mcp_read_dir(self, docs_dir: str) -> List[Dict[str, Any]]:
-        """只通过 MCP 读取文件（file.read_dir）。"""
-        if not self.router:
-            return []
-        args = {
-            "dir": docs_dir,
-            "patterns": ["*.pdf", "*.txt", "*.md", "*.docx"],
-            "recursive": True,
-            "limit": None,
-            "normalize": True,
-        }
-        try:
-            res = await _tools_call(self.router, "file.read_dir", args)
-            return res.get("files", []) if isinstance(res, dict) else []
-        except Exception:
-            # MCP 不可用或失败就返回空，外面会做本地兜底
-            return []
-
-    async def reindex(self) -> dict:
-        """
-        重新构建索引：
-          1) 用 MCP 读取原始文件内容（仅 read_dir）
-          2) 用本地 chunker 切割（可走 LLM 大纲）
-          3) 写入 retriever（带 built_by 和 docs_sig）
-        """
-        print("强制重建索引中...")
-
-        # 1) 读取文件（优先 MCP）
-        files = await self._mcp_read_dir(str(APP.rag.docs_dir))
-        used_mcp = bool(files)
-
-        # 2) 本地兜底读取（若 MCP 不可用）
-        if not files:
-            from pathlib import Path
-            print("➡️ 使用本地文件读取 fallback")
-            base = Path(APP.rag.docs_dir)
-            for p in base.rglob("*"):
-                if p.is_file() and p.suffix.lower() in (".pdf", ".txt", ".md", ".docx"):
-                    try:
-                        content = p.read_text("utf-8", errors="ignore")
-                    except Exception:
-                        content = ""
-                    try:
-                        st = p.stat()
-                        mtime = int(st.st_mtime)
-                        size = int(st.st_size)
-                    except Exception:
-                        mtime = 0
-                        size = len(content)
-                    files.append({
-                        "meta": {"source": str(p), "mtime": mtime, "size": size},
-                        "content": content
-                    })
-
-        # 2.5) 计算 docs 签名（统一：按 source/mtime/size）
-        import hashlib
-        sig_items = []
-        for f in files:
-            meta = f.get("meta") or {}
-            src = str(meta.get("source") or meta.get("path") or "unknown")
-            mtime = int(meta.get("mtime", 0)) if isinstance(meta.get("mtime", 0), (int, float)) else 0
-            size_meta = int(meta.get("size", 0)) if isinstance(meta.get("size", 0), (int, float)) else 0
-            content = f.get("content") or ""
-            size_for_sig = size_meta if size_meta > 0 else len(content)
-            sig_items.append((src, mtime, int(size_for_sig)))
-        h = hashlib.sha256()
-        for k, m, s in sorted(sig_items, key=lambda x: x[0]):
-            h.update(str(k).encode());
-            h.update(b"|")
-            h.update(str(int(m)).encode());
-            h.update(b"|")
-            h.update(str(int(s)).encode());
-            h.update(b"\n")
-        docs_sig = h.hexdigest()
-
-        # 3) 本地切割（替代 MCP file.chunk），chunker 名称来自 config
-        texts, metadatas = [], []
-        total_chunks = 0
-        for f in files:
-            text = (f.get("content") or "").strip()
-            if not text:
-                continue
-            meta = f.get("meta") or {}
-            chunks = self._chunker.split(text)
-            total_chunks += len(chunks)
-            for i, ch in enumerate(chunks):
-                texts.append(ch)
-                metadatas.append(meta | {"chunk_id": i, "text": ch})
-
-        # 4) 写入索引（尽量适配不同 Retriever 实现）
-        async def maybe_await(x):
-            return await x if asyncio.iscoroutine(x) else x
+    async def step(self, text: str, mode: str | None = None) -> OrchestratorResult:
+        mode = mode or self._infer_mode(text)
+        used_tools: List[ToolCall] = []
+        retrieve_hits: List[RetrieveHit] = []
+        errors: List[str] = []
 
         try:
-            built_by = f"reader:{'mcp' if used_mcp else 'local'}; chunker:{CHUNK.name}"
-            if hasattr(self.retriever, "rebuild_from_texts"):
-                await maybe_await(self.retriever.rebuild_from_texts(
-                    texts, metadatas, built_by=built_by, docs_sig=docs_sig
-                ))
-            elif hasattr(self.retriever, "rebuild"):
-                # 旧接口：无法传 built_by/docs_sig，只能维持旧行为
-                await maybe_await(self.retriever.rebuild(texts=texts, metadatas=metadatas))
-            elif hasattr(self.retriever, "upsert_many"):
-                await maybe_await(self.retriever.upsert_many(texts, metadatas, rebuild=True))
-            elif hasattr(self.retriever, "add_texts"):
-                await maybe_await(self.retriever.add_texts(texts, metadatas))
+            if mode == "solve":
+                expr = _strip_cmd(text, "/solve")
+                res = tool_call("math.solve_equation", {"expr": expr, "var": "x"})
+                used_tools.append(ToolCall(name="math.solve_equation", args={"expr": expr, "var": "x"}, via="mcp"))
+                final = f"答案：{res.get('solutions')}"
+
+            elif mode == "diff":
+                expr = _strip_cmd(text, "/diff")
+                res = tool_call("math.diff", {"expr": expr, "var": "x"})
+                used_tools.append(ToolCall(name="math.diff", args={"expr": expr, "var": "x"}, via="mcp"))
+                final = f"导数：{res.get('derivative')}"
+
+            elif mode == "integrate":
+                expr = _strip_cmd(text, "/integrate")
+                res = tool_call("math.integrate", {"expr": expr, "var": "x"})
+                used_tools.append(ToolCall(name="math.integrate", args={"expr": expr, "var": "x"}, via="mcp"))
+                final = f"不定积分：{res.get('integral')} + C"
+
+            elif mode == "matmul":
+                body = _strip_cmd(text, "/matmul")
+                A, B = _parse_matmul_args(body)
+                res = tool_call("math.matrix_multiply", {"A": A, "B": B})
+                used_tools.append(ToolCall(name="math.matrix_multiply", args={"A": A, "B": B}, via="mcp"))
+                final = f"结果矩阵：{res.get('matrix')}，形状：{res.get('shape')}"
+
+            elif mode == "plot":
+                body = _strip_cmd(text, "/plot")
+                expr, start, end = _parse_plot_args(body)
+                res = tool_call("math.plot", {"expr": expr, "var": "x", "start": start, "end": end})
+                used_tools.append(ToolCall(name="math.plot", args={"expr": expr, "start": start, "end": end}, via="mcp"))
+                final = f"已生成：{res.get('path')}（{res.get('width_px')}×{res.get('height_px')} px, 区间 {res.get('x_range')}，采样 {res.get('samples')}）"
+
+
+
+            elif mode == "run":
+                # 期望格式（单行）：
+                # /run python print(sum(i for i in range(10)))
+                # /run c    #include <stdio.h>\nint main(){printf("Hello C!\\n");return 0;}
+                # /run cpp  #include <iostream>\nusing namespace std;\nint main(){cout<<"Hello C++!"<<endl;return 0;}
+                # /run java public class Main{public static void main(String[] args){System.out.println("Hello Java!");}}
+                parts = text.split(maxsplit=2)
+                if len(parts) < 3:
+                    raise ValueError("用法：/run <python|c|cpp|c++|cxx|java> <code-单行，可含\\n>")
+                _, lang_raw, code_raw = parts
+                lang = lang_raw.lower()
+
+                # 把未转义的 \n/\t 展开成真正换行（字符串里的 \\n 不动）
+                code = _unescape_one_line(code_raw)
+
+                if not code.strip():
+                    raise ValueError("code 不能为空。请把代码与命令放在同一行；多行请用 \\n 连接。")
+
+                lang2tool = {
+                    "python": "python.run_code", "py": "python.run_code",
+                    "c": "c.run_code",
+                    "cpp": "cpp.run_code", "c++": "cpp.run_code", "cxx": "cpp.run_code",
+                    "java": "java.run_code",
+                }
+                tool_name = lang2tool.get(lang)
+                if not tool_name:
+                    raise ValueError(f"不支持的语言：{lang_raw}")
+
+                res = tool_call(tool_name, {"code": code, "timeout": float(getattr(settings, "RUNNER_TIMEOUT_SEC", 3.0))})
+                used_tools.append(ToolCall(name=tool_name, args={"timeout": getattr(settings, "RUNNER_TIMEOUT_SEC", 3.0)}, via="mcp"))
+
+                if tool_name == "python.run_code":
+                    final = f"stdout:\n{res.get('stdout', '')}\n\nstderr:\n{res.get('stderr', '')}"
+                else:
+                    comp = res.get("compile", {})
+                    run = res.get("run", {})
+                    final = (
+                        "=== compile ===\n"
+                        f"exit: {comp.get('exit_code')}  time: {comp.get('time_ms')}ms\n"
+                        f"stdout:\n{comp.get('stdout', '')}\n"
+                        f"stderr:\n{comp.get('stderr', '')}\n\n"
+                        "=== run ===\n"
+                        f"exit: {run.get('exit_code')}  time: {run.get('time_ms', '')}ms\n"
+                        f"stdout:\n{run.get('stdout', '')}\n"
+                        f"stderr:\n{run.get('stderr', '')}\n"
+                    )
+
+            elif mode == "reindex":
+                from retriever.indexer import reindex
+                stats = reindex()
+                final = f"✅ 索引已重建  (chunks={stats['chunks']})"
+
             else:
-                return {"chunks": total_chunks, "built_by": built_by + "; no-op"}
+                import re
+                from typing import List
+
+                # —— 通用工具 —— #
+                def tokenize(s: str) -> List[str]:
+                    return [t for t in re.split(r"[^0-9a-zA-Z]+", s.lower()) if t]
+
+                def build_subqueries(q: str) -> List[str]:
+                    """
+                    通用多子查询：原始查询 + 清洗版 + 数字/短语切片
+                    - 适配任何主题；无课程/文件名硬编码
+                    """
+                    qs = [q]
+                    ql = q.lower().strip()
+                    # 轻清洗（中英混排的常见字符替换）
+                    zh = q.replace("：", ":").replace("（", "(").replace("）", ")")
+                    if zh != q: qs.append(zh)
+                    # 拆短语（防止长句导致语义稀释）
+                    toks = tokenize(q)
+                    if len(toks) >= 2:
+                        qs.append(" ".join(toks[:4]))
+                    # 数字片段（如 “2”, “02”, 年份/编号等都能泛化）
+                    nums = [t for t in toks if t.isdigit()]
+                    for n in nums:
+                        qs += [n, f"{int(n):02d}"]
+                    # 去重
+                    seen, out = set(), []
+                    for s in qs:
+                        s = s.strip()
+                        if s and s.lower() not in seen:
+                            seen.add(s.lower());
+                            out.append(s)
+                    return out
+
+                def overlap_score(query: str, text: str, alpha: float = 1.0) -> float:
+                    """
+                    通用重合度：query tokens 与 text tokens 的对称归一化重叠
+                    """
+                    q = set(tokenize(query));
+                    t = set(tokenize(text))
+                    if not q or not t: return 0.0
+                    inter = len(q & t)
+                    return alpha * (inter / ((len(q) * len(t)) ** 0.5))
+
+                def path_bonus(query: str, path: str) -> float:
+                    """
+                    路径词重合（目录名/文件名对任何语料都适用；无硬编码）
+                    """
+                    segs = [p for p in re.split(r"[\\/]+", path.lower()) if p]
+                    return max((overlap_score(query, s, 0.12) for s in segs), default=0.0)
+
+                def title_bonus(query: str, chunk_text: str) -> float:
+                    """
+                    标题/开头重合：取 chunk 首两行，适配 lecture/报告/合同/博客等任意文体
+                    """
+                    head = "\n".join(chunk_text.strip().splitlines()[:2])
+                    return overlap_score(query, head, 0.10)
+
+                def keyword_bonus(query: str, chunk_text: str) -> float:
+                    """
+                    关键词计数：对 >=3 字符的查询 token 做出现次数统计（通用）
+                    """
+                    qts = set(t for t in tokenize(query) if len(t) >= 3)
+                    if not qts: return 0.0
+                    t = chunk_text.lower()
+                    hits = sum(t.count(k) for k in qts)
+                    return 0.03 * hits
+
+                # —— 多路召回 —— #
+                subqs = build_subqueries(text)
+                print(f"[retriever] subqueries={subqs}")
+
+                seen_ids = set()
+                merged = []
+                for sq in subqs:
+                    hits = retrieve_query(sq, settings.TOP_K)  # -> [(dense_score, meta), ...]
+                    for dense, meta in hits:
+                        hid = f"{meta['path']}#{meta['chunk_id']}"
+                        if hid in seen_ids: continue
+                        seen_ids.add(hid)
+                        merged.append(RetrieveHit(
+                            doc_id=hid,
+                            score=float(dense),  # 先存向量相似度
+                            chunk=meta['text'],  # 你当前存的是前200字符，可考虑存更长前缀
+                            source=meta['path'],
+                        ))
+
+                # —— 通用融合打分（无任何语料/课程硬编码）—— #
+                W_DENSE, W_PATH, W_TITLE, W_KW = 1.00, 0.40, 0.30, 0.60
+                for h in merged:
+                    h.score = (
+                            W_DENSE * h.score
+                            + W_PATH * path_bonus(text, h.source)
+                            + W_TITLE * title_bonus(text, h.chunk)
+                            + W_KW * keyword_bonus(text, h.chunk)
+                    )
+
+                merged.sort(key=lambda x: x.score, reverse=True)
+                top_hits = merged[:max(8, settings.TOP_K)]
+
+                print(f"[retriever] merged_hits={len(merged)}, top_hits={len(top_hits)}")
+                for i, h in enumerate(top_hits[:5]):
+                    print(f"[retriever] hit{i}: score={h.score:.3f} path={h.source}")
+
+                ctx_snips = [f"[source: {h.source}, score={h.score:.3f}]\n{h.chunk}" for h in top_hits]
+                ctx_text = "\n\n".join(ctx_snips) if ctx_snips else "(none)"
+
+                llm = self._llm or LLM();
+                self._llm = llm
+                system_prompt = (
+                    "You are a concise, precise assistant. Use the provided CONTEXT when relevant. "
+                    "If the context is not relevant or empty, answer from your general knowledge. "
+                    "Do not fabricate citations."
+                )
+                user_prompt = f"QUESTION:\n{text}\n\nCONTEXT:\n{ctx_text}"
+
+                final = llm.complete_sync(
+                    [{"role": "system", "content": system_prompt},
+                     {"role": "user", "content": user_prompt}],
+                    temperature=0.2
+                )
+
+
+
         except Exception as e:
-            return {"chunks": total_chunks, "built_by": f"error:{e}"}
+            errors.append(str(e))
+            final = f"发生错误：{e!r}"
 
-        return {"chunks": total_chunks, "built_by": built_by}
+        return OrchestratorResult(final_text=final, used_tools=used_tools, retrieve_hits=retrieve_hits, errors=errors)
 
-    async def step(self, user_text: str, mode="qa"):
-        self.memory.add_user(user_text)
-
-        # --- 新增：run 模式（不走 LLM） ---
-        if mode == "run":
-            if not self.router:
-                msg = "工具不可用：未连接 MCP。请在配置中启用 code_server。"
-                self.memory.add_assistant(msg)
-                return msg
-            try:
-                msg = await _run_mode_dispatch(self.router, user_text)
-            except Exception as e:
-                msg = f"运行失败：{e}"
-            self.memory.add_assistant(msg)
-            return msg
-
-        # 1) RAG 检索
-        rag_ctx = []
-        if self.rag_top_k and self.rag_top_k > 0:
-            rag_ctx = await self.retriever.topk(user_text, self.rag_top_k)
-
-        # 2) 工具调用（仅在 solve 模式：自动路由“做题”）
-        tool_obs = None
-        if mode == "solve" and self.router:
-            txt = user_text.strip()
-            try:
-                # ---------- 画图：画图 <expr> 从 <start> 到 <end> ----------
-                m = re.match(r"^画图\s+(.+?)\s+从\s+(-?\d+(?:\.\d+)?)\s+到\s+(-?\d+(?:\.\d+)?)\s*$", txt)
-                if m:
-                    expr, start, end = m.group(1), float(m.group(2)), float(m.group(3))
-                    res = await _tools_call(self.router, "math.plot",
-                                            {"expr": expr, "var": "x", "start": start, "end": end, "num": 600})
-                    path = res.get("path") or res.get("image_path")
-                    tool_obs = f"[math.plot] {json.dumps(res, ensure_ascii=False)}"
-                    self.memory.add_assistant(f"✅ 已生成图像：{path}")
-
-                # ---------- 矩阵乘法 ----------
-                if tool_obs is None:
-                    m2 = re.match(r"^(?:矩阵乘法|计算)\s+(\[.*\])\s*(?:\*|×|x)\s*(\[.*\])\s*$",
-                                  txt.replace(" ", ""))
-                    if not m2:
-                        m2 = re.match(r"^(?:矩阵乘法|计算)\s+(\[.*\])\s*(?:\*|×|x)\s*(\[.*\])\s*$", txt)
-                    if m2:
-                        A = _parse_matrix_side(m2.group(1))
-                        B = _parse_matrix_side(m2.group(2))
-                        res = await _tools_call(self.router, "math.matrix_multiply", {"A": A, "B": B})
-                        tool_obs = f"[math.matrix_multiply] {json.dumps(res, ensure_ascii=False)}"
-                        mat = res.get("matrix") or res.get("result")
-                        shape = res.get("shape")
-                        self.memory.add_assistant(f"✅ 矩阵乘法结果（shape={shape}）：\n{mat}")
-
-                # ---------- 求导 ----------
-                if tool_obs is None:
-                    m3 = re.match(r"^对\s+(.+?)\s+求导\s*$", txt)
-                    if m3:
-                        expr = m3.group(1)
-                        res = await _tools_call(self.router, "math.diff", {"expr": expr, "var": "x"})
-                        tool_obs = f"[math.diff] {json.dumps(res, ensure_ascii=False)}"
-                        self.memory.add_assistant(f"∂/∂x {expr} = {res.get('derivative')}")
-
-                # ---------- 积分 ----------
-                if tool_obs is None:
-                    m4 = re.match(r"^对\s+(.+?)\s+积分\s*$", txt)
-                    if m4:
-                        expr = m4.group(1)
-                        res = await _tools_call(self.router, "math.integrate", {"expr": expr, "var": "x"})
-                        tool_obs = f"[math.integrate] {json.dumps(res, ensure_ascii=False)}"
-                        self.memory.add_assistant(f"∫ {expr} dx = {res.get('integral')} + C")
-
-                # ---------- 解方程（兜底） ----------
-                if tool_obs is None:
-                    looks_like_equation = ("=" in txt) or ("解方程" in txt) or ("求解" in txt)
-                    if looks_like_equation:
-                        res = await _tools_call(self.router, "math.solve_equation", {"expr": txt, "var": "x"})
-                        tool_obs = f"[math.solve_equation] {json.dumps(res, ensure_ascii=False)}"
-                        sols = res.get("solutions", [])
-                        self.memory.add_assistant(f"解：{', '.join(map(str, sols)) if sols else '(无解或非代数方程)'}")
-            except Exception as e:
-                tool_obs = f"[tool_error] {e}"
-
-        # 3) LLM 生成
-        messages = build_messages(self.memory, rag_ctx, tool_obs, mode)
-        reply = await self.llm.complete(messages)
-        self.memory.add_assistant(reply)
-        return reply
+    def _infer_mode(self, text: str) -> str:
+        if text.startswith("/solve"): return "solve"
+        if text.startswith("/diff"): return "diff"
+        if text.startswith("/integrate"): return "integrate"
+        if text.startswith("/matmul"): return "matmul"
+        if text.startswith("/plot"): return "plot"
+        if text.startswith("/run"): return "run"
+        if text.startswith("/reindex"): return "reindex"
+        if text.startswith("/explain"): return "explain"
+        return "qa"
